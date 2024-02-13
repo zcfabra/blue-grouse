@@ -1,10 +1,11 @@
-use std::fmt::{self, Display};
+use std::{env, error::Error, fmt, io::{self, BufRead, Write}, process::{Command, Stdio}};
+use url::Url;
+use regex::Regex;
+
 
 use colored::Colorize;
 use sqlx::prelude::FromRow;
 use sqlx_postgres::PgPool;
-
-const DB_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/pgrs";
 
 const GET_FOREIGN_KEYS: &str = "
 SELECT
@@ -57,6 +58,58 @@ struct Builder {
     schema_name: String
 }
 
+// enum ObjectType {
+//     VIEW,
+//     TABLE,
+//     INDEX,
+//     FOREIGNKEY 
+// }
+struct ScriptBuilder {
+    object_name: String, 
+    object_type: String,
+}
+
+struct DBContext {
+    host: String,
+    username: String,
+    db_name: String,
+    password: String
+}
+
+
+impl ScriptBuilder {
+    fn get_create_script(&self, db_context: &DBContext) -> Result<String, ()> {
+        let _ = std::env::set_var("PGPASSWORD", &db_context.password);
+        let pg_dump = Command::new("pg_dump")
+        .arg("-U")
+        .arg(&db_context.username)
+        .arg("-d")
+        .arg(&db_context.db_name)
+        .arg("-t")
+        .arg(&self.object_name)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("SPAWN ERROR");
+
+    let sed_output = Command::new("sed")
+        .arg("-n")
+        .arg("-e")
+        .arg("/^CREATE VIEW/,/;/p")
+        .stdin(pg_dump.stdout.unwrap())
+        .output()
+        .expect("ERROR SPAWNING SED");
+
+    // Read the output of pg_dump
+    return Ok(String::from_utf8(sed_output.stdout).expect("Should be able to send bytes to string"));
+    // let status = pg_dump.wait().expect("CANTE");
+    // if !status.success() {
+    //     eprintln!("pg_dump failed with exit code: {}", status);
+    //     std::process::exit(1);
+    // }
+    }
+
+}
+
 #[derive(FromRow, Debug)]
 struct DependentObject {
     dependent_schema: String,
@@ -67,7 +120,7 @@ struct DependentObject {
 }
 
 impl std::fmt::Display for DependentObject {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut cols_str = String::new();
         for (ix, col_name) in self.column_names.iter().enumerate() {
             let fmt_col_name = if ix != 0 {
@@ -79,8 +132,8 @@ impl std::fmt::Display for DependentObject {
         }
         println!(
             "{} depends on {} via columns ({})",
-            format!("{}.{}",self.dependent_schema, self.dependent_view).bold().red(),
-            format!("{}.{}",self.source_schema, self.source_table).bold().red(),
+            format!("{}.{}",self.dependent_schema, self.dependent_view).bold().bright_magenta(),
+            format!("{}.{}",self.source_schema, self.source_table).bold().bright_magenta(),
             cols_str.bold().blue()
         );
         return Ok(());
@@ -100,10 +153,10 @@ struct ForeignKey {
 }
 
 impl std::fmt::Display for ForeignKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         println!(
             "{} {} ({}.{}) --> {} ({}.{})",
-            format!("{} {}:", "FK", self.constraint_name).bold().red(),
+            format!("{} {}:", "FK", self.constraint_name).bold().bright_magenta(),
             self.dependent_column_name.bold(),
             self.dependent_table_schema,
             self.dependent_table_name,
@@ -138,36 +191,70 @@ impl Builder {
         
 } 
 
+fn parse_postgres_url(url: &str) -> Result<DBContext, Box<dyn Error>> {
+    let parsed_url = Url::parse(url)?;
+
+    let host = parsed_url.host_str().ok_or("No host found")?.to_string();
+    let username = parsed_url.username().to_string();
+    let db_name = parsed_url.path().trim_start_matches('/').to_string();
+
+    let password = match parsed_url.password() {
+        Some(password) => password.to_string(),
+        None => String::new(),
+    };
+
+    Ok(DBContext {
+        host,
+        username,
+        db_name,
+        password,
+    })
+}
+
 #[tokio::main]
 async fn main() {
-    let pool = PgPool::connect(DB_URL).await.expect("Failed to connect to DB");
+    let key = "DB_URL";
+    let db_url_opt = env::var_os(key).expect("No DB URL Provided");
+    if let Some(db_url) = db_url_opt.to_str() {
+        let db_context = parse_postgres_url(db_url).unwrap();
+        let pool = PgPool::connect(db_url).await.expect("Failed to connect to DB");
+        let b = Builder{
+            pool:pool,
+            table_name: String::from("room"),
+            schema_name: String::from("location")
+        };
 
-    let b = Builder{
-        pool:pool,
-        table_name: String::from("room"),
-        schema_name: String::from("location")
-    };
-
-    match b.get_foreign_keys().await {
-        Ok(keys) => {
-            for key in keys {
-                println!("{}", key);
+        match b.get_foreign_keys().await {
+            Ok(keys) => {
+                for key in keys {
+                    println!("{}", key);
+                }
+            },
+            Err(err) => {
+                println!("{:?}", err);
             }
-        },
-        Err(err) => {
-            println!("{:?}", err);
-        }
-        
-    };
+            
+        };
 
-    match b.get_dependent_objects().await {
-        Ok(objects)=>{
-            for obj in objects {
-                println!("{}", obj);
+        match b.get_dependent_objects().await {
+            Ok(objects)=>{
+                for obj in objects {
+                    println!("{}", obj);
+                    // let sb = ScriptBuilder{
+                    //     object_name: format!("{}.{}", obj.dependent_schema, obj.dependent_view),
+                    //     object_type: String::from("VIEW")
+                    // };
+                    // if let Ok(script) = sb.get_create_script(&db_context) {
+                    //     println!("{script}");
+                    // } else {
+                    //     println!("ERROR GETTING SCRIPT");
+                    // }
+                }
+            },
+            Err(err) => {
+                println!("{:?}", err);
             }
-        },
-        Err(err) => {
-            println!("{:?}", err);
         }
     }
+    
 }
