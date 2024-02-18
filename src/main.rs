@@ -1,11 +1,12 @@
-use std::{env, error::Error, fmt, io::{self, BufRead, Write}, process::{Command, Stdio}};
-use url::Url;
-use regex::Regex;
+use std::{env, error::{self, Error}, fmt, fs::File, io::{self, BufRead, Read, Write}, process::{Command, Stdio}, str::FromStr};
+use serde_json::Value;
+use anyhow::{Result, anyhow};
 
 
 use colored::Colorize;
-use sqlx::prelude::FromRow;
-use sqlx_postgres::PgPool;
+use sqlx::{prelude::FromRow, ConnectOptions};
+use sqlx_postgres::{PgConnectOptions, PgPool};
+use sqlx_core::Url;
 
 const GET_FOREIGN_KEYS: &str = "
 SELECT
@@ -64,10 +65,12 @@ struct Builder {
 //     INDEX,
 //     FOREIGNKEY 
 // }
-struct ScriptBuilder {
+struct ScriptBuilder<'a> {
+    db_context: &'a DBContext,
     object_name: String, 
     object_type: String,
 }
+
 
 struct DBContext {
     host: String,
@@ -77,14 +80,30 @@ struct DBContext {
 }
 
 
-impl ScriptBuilder {
-    fn get_create_script(&self, db_context: &DBContext) -> Result<String, ()> {
-        let _ = std::env::set_var("PGPASSWORD", &db_context.password);
+impl DBContext{
+    
+    fn from_url(url: &Url) -> Result<Self> {
+        return Ok(
+            DBContext{
+                username: url.username().to_string(),
+                password: url.password().unwrap().to_string(),
+                host: url.host().expect("No host provided").to_string(),
+                db_name: url.path().strip_prefix("/").unwrap().to_string()
+            }
+        )
+    }
+
+}
+
+
+impl ScriptBuilder<'_> {
+    fn get_create_script(&self) -> Result<String, ()> {
+        let _ = std::env::set_var("PGPASSWORD", &self.db_context.password);
         let pg_dump = Command::new("pg_dump")
         .arg("-U")
-        .arg(&db_context.username)
+        .arg(&self.db_context.username)
         .arg("-d")
-        .arg(&db_context.db_name)
+        .arg(&self.db_context.db_name)
         .arg("-t")
         .arg(&self.object_name)
         .stdout(Stdio::piped())
@@ -170,6 +189,19 @@ impl std::fmt::Display for ForeignKey {
 }
 
 impl Builder {
+    async fn list_dependent_objects(&self) -> () {
+        match self.get_dependent_objects().await {
+            Ok(objects)=>{
+                for obj in objects {
+                    println!("{}", obj);
+                }
+            },
+            Err(err) => {
+                println!("{:?}", err);
+            }
+        }
+    }
+
     async fn get_dependent_objects(&self) -> Result<Vec<DependentObject>, sqlx::Error>{
         let rows: Vec<DependentObject>= sqlx::query_as(GET_DEPENDENT_OBJECTS)
             .bind(&self.schema_name)
@@ -178,6 +210,20 @@ impl Builder {
             .await?;
 
         return Ok(rows);
+    }
+
+    async fn list_foreign_keys(&self) -> () {
+        match self.get_foreign_keys().await {
+            Ok(keys) => {
+                for key in keys {
+                    println!("{}", key);
+                }
+            },
+            Err(err) => {
+                println!("{:?}", err);
+            }
+    };
+
     }
 
     async fn get_foreign_keys(&self) -> Result<Vec<ForeignKey>, sqlx::Error> {
@@ -191,70 +237,47 @@ impl Builder {
         
 } 
 
-fn parse_postgres_url(url: &str) -> Result<DBContext, Box<dyn Error>> {
-    let parsed_url = Url::parse(url)?;
+fn get_db_url_from_config() -> Result<String> {
+    let mut file = File::open("./config.json")?;
+    let mut contents = String::new();
 
-    let host = parsed_url.host_str().ok_or("No host found")?.to_string();
-    let username = parsed_url.username().to_string();
-    let db_name = parsed_url.path().trim_start_matches('/').to_string();
+    file.read_to_string(&mut contents)?;
 
-    let password = match parsed_url.password() {
-        Some(password) => password.to_string(),
-        None => String::new(),
-    };
+    let json: Value = serde_json::from_str(&contents)?;
 
-    Ok(DBContext {
-        host,
-        username,
-        db_name,
-        password,
-    })
+    if let Some(db_url) = json.get("DB_URL") {
+        let str_url = db_url.as_str().unwrap();
+        return Ok(str_url.to_string());
+    }
+    return Err(anyhow!("Hi"));
 }
 
 #[tokio::main]
 async fn main() {
-    let key = "DB_URL";
-    let db_url_opt = env::var_os(key).expect("No DB URL Provided");
-    if let Some(db_url) = db_url_opt.to_str() {
-        let db_context = parse_postgres_url(db_url).unwrap();
-        let pool = PgPool::connect(db_url).await.expect("Failed to connect to DB");
-        let b = Builder{
-            pool:pool,
-            table_name: String::from("room"),
-            schema_name: String::from("location")
-        };
+    let db_url  =  get_db_url_from_config().expect("Couldn't parse URL");
+    let url: Url = db_url.parse().expect("Could not parse connection string into URL");
+    let options = PgConnectOptions::from_url(&url).expect("Error Parsing Connection Options");
 
-        match b.get_foreign_keys().await {
-            Ok(keys) => {
-                for key in keys {
-                    println!("{}", key);
-                }
-            },
-            Err(err) => {
-                println!("{:?}", err);
-            }
-            
-        };
+    let dbc = DBContext::from_url(&url).expect("Error building context from DB URL");
 
-        match b.get_dependent_objects().await {
-            Ok(objects)=>{
-                for obj in objects {
-                    println!("{}", obj);
-                    // let sb = ScriptBuilder{
-                    //     object_name: format!("{}.{}", obj.dependent_schema, obj.dependent_view),
-                    //     object_type: String::from("VIEW")
-                    // };
-                    // if let Ok(script) = sb.get_create_script(&db_context) {
-                    //     println!("{script}");
-                    // } else {
-                    //     println!("ERROR GETTING SCRIPT");
-                    // }
-                }
-            },
-            Err(err) => {
-                println!("{:?}", err);
-            }
+    let pool = PgPool::connect_with(options)
+        .await
+        .expect("Failed to connect to DB");
+
+    let b = Builder{
+        pool:pool,
+        table_name: String::from("room"),
+        schema_name: String::from("location")
+    };
+    if let Ok(views) = b.get_dependent_objects().await {
+        for vw in views {
+            let crs = ScriptBuilder{
+                db_context: &dbc,
+                object_name: format!("{}.{}", vw.dependent_schema, vw.dependent_view),
+                object_type: "VIEW".to_string()
+            }.get_create_script().expect("error formatting script");
+            println!("{}", crs);
         }
     }
-    
+
 }
