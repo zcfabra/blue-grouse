@@ -90,31 +90,51 @@ async fn main() {
         db_context: &dbc
     };
 
-    if let Ok(dep_objs) = builder.get_dependent_objects().await {
-        for dep_obj in dep_objs {
-            match script_generator.get_create_script(
-                dep_obj.get_full_name(),
-                dep_obj.get_type_name().to_string()
-            ) {
+    let dep_objs = builder
+        .get_dependent_objects()
+        .await
+        .expect("Error getting dependent objects");
 
-                Ok(script) => println!("{}", script),
-                Err(_) => println!("Failed to print script for dependent script")
-            }
+    let fks = builder
+        .get_foreign_keys()
+        .await
+        .expect("Error getting foreign keys");
+
+    println!("-- DELETE DEPDENDENTS\n\n");
+    for dep_obj in dep_objs.iter() {
+        println!("-- VIEW {}", dep_obj.get_full_name());
+        let script = script_generator.get_delete_script(
+            dep_obj.get_full_name(), 
+            "VIEW".to_string()
+        );
+        println!("{}\n\n", script);
+    }
+    for fk in fks.iter() {
+        println!("-- FK {}", fk.constraint_name);
+        let script = script_generator.get_fk_delete_script(fk);
+        println!("{}\n\n", script);
+    }    for dep_obj in dep_objs.iter() {
+        println!("-- VIEW {}", dep_obj.dependent_view);
+        match script_generator.get_create_script(
+            dep_obj.get_full_name(),
+            dep_obj.get_type_name().to_string()
+        ) {
+            Ok(script) => println!("{}\n\n", script),
+            Err(_) => println!("Failed to print script for dependent script")
         }
     };
+    println!("\n\n\n\n\n\n");
      
-    if let Ok(fks) = builder.get_foreign_keys().await {
-        for fk in fks {
-            println!("-- FK {}", fk.constraint_name);
-            match script_generator.get_create_fk_script(fk) {
-                Ok(script) => println!("{}", script),
-                Err(_)=>print!("Failed to print script for FK")
-            }
-
+    println!("-- ADD BACK DEPENDENTS\n\n");
+    for fk in fks {
+        println!("-- FK {}", fk.constraint_name);
+        match script_generator.get_create_fk_script(fk) {
+            Ok(script) => println!("{}", script),
+            Err(_)=>print!("Failed to print script for FK")
         }
-    } else {
-        print!("OUCH");
-    }
+
+    } 
+    
 
 
 }

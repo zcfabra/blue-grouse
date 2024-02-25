@@ -1,5 +1,7 @@
 use std::{io::Read, process::{Command, Stdio}};
 
+use anyhow::Result;
+
 use crate::{dependent_builder::{DependentObject, ForeignKey}, DBContext};
 
 pub struct ScriptBuilder<'a> {
@@ -7,7 +9,16 @@ pub struct ScriptBuilder<'a> {
 }
 
 impl ScriptBuilder<'_> {
-    pub fn get_create_script(&self, obj_name: String, obj_type: String) -> Result<String, ()> {
+    pub fn get_delete_script(&self, obj_name: String, obj_type: String) -> String {
+        return format!("DROP {obj_type} {obj_name};");
+    }
+    pub fn get_fk_delete_script(&self, fk: &ForeignKey) -> String {
+        return format!(
+            "ALTER TABLE {} DROP CONSTRAINT {}",
+            fk.get_parent_table_name(), fk.constraint_name
+        );
+    }
+    pub fn get_create_script(&self, obj_name: String, obj_type: String) -> Result<String> {
         let _ = std::env::set_var("PGPASSWORD", &self.db_context.password);
         let pg_dump = Command::new("pg_dump")
         .arg("-U")
