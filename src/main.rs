@@ -96,6 +96,7 @@ async fn main() {
                 dep_obj.get_full_name(),
                 dep_obj.get_type_name().to_string()
             ) {
+
                 Ok(script) => println!("{}", script),
                 Err(_) => println!("Failed to print script for dependent script")
             }
