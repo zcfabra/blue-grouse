@@ -1,4 +1,4 @@
-use std::{io::Read, process::{Command, Stdio}};
+use std::{fs, io::Read, process::{Command, Stdio}};
 
 use anyhow::Result;
 
@@ -6,30 +6,45 @@ use crate::{dependent_builder::{DependentObject, ForeignKey}, DBContext};
 
 pub struct ScriptBuilder<'a> {
     pub db_context: &'a DBContext,
+    pub file_buffer: String
 }
 
 impl ScriptBuilder<'_> {
+    pub fn display(&self){ 
+        println!("{}", self.file_buffer);
+    }
+
+    pub fn save_file(&self, file_path: String) {
+        match fs::write(&file_path, &self.file_buffer) {
+        Ok(_) => println!("Committed File To {}", &file_path),
+        Err(e) => eprintln!("Error writing to {}: {}", file_path, e),
+    }
+    }
+
+    pub fn add_buffer_line(&mut self, content: &str) {
+        self.file_buffer.push_str(content);
+    }
     pub fn get_delete_script(&self, obj_name: String, obj_type: String) -> String {
         return format!("DROP {obj_type} {obj_name};");
     }
     pub fn get_fk_delete_script(&self, fk: &ForeignKey) -> String {
         return format!(
-            "ALTER TABLE {} DROP CONSTRAINT {}",
+            "ALTER TABLE {}\nDROP CONSTRAINT {};",
             fk.get_parent_table_name(), fk.constraint_name
         );
     }
     pub fn get_create_script(&self, obj_name: String, obj_type: String) -> Result<String> {
         let _ = std::env::set_var("PGPASSWORD", &self.db_context.password);
         let pg_dump = Command::new("pg_dump")
-        .arg("-U")
-        .arg(&self.db_context.username)
-        .arg("-d")
-        .arg(&self.db_context.db_name)
-        .arg("-t")
-        .arg(obj_name)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("SPAWN ERROR");
+            .arg("-U")
+            .arg(&self.db_context.username)
+            .arg("-d")
+            .arg(&self.db_context.db_name)
+            .arg("-t")
+            .arg(obj_name)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("SPAWN ERROR");
 
     let sed_output = Command::new("sed")
         .arg("-n")
