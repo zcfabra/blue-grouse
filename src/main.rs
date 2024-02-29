@@ -101,7 +101,7 @@ async fn main() {
         .await
         .expect("Error getting foreign keys");
 
-    script_generator.add_buffer_line("-- DELETE DEPDENDENTS\n\n");
+    script_generator.add_buffer_line("-- DELETE DEPENDENTS\n\n");
 
     for dep_obj in dep_objs.iter() {
         let obj_name = dep_obj.get_full_name();
