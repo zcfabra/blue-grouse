@@ -36,6 +36,8 @@ impl ScriptBuilder<'_> {
     pub fn get_create_script(&self, obj_name: String, obj_type: String) -> Result<String> {
         let _ = std::env::set_var("PGPASSWORD", &self.db_context.password);
         let pg_dump = Command::new("pg_dump")
+            .arg("-h")
+            .arg(&self.db_context.host)
             .arg("-U")
             .arg(&self.db_context.username)
             .arg("-d")
@@ -67,6 +69,8 @@ impl ScriptBuilder<'_> {
     pub fn get_create_fk_script(&self, fk: ForeignKey) -> Result<String, ()> {
         let _ = std::env::set_var("PGPASSWORD", &self.db_context.password);
         let pg_dump = Command::new("pg_dump")
+        .arg("-h")
+        .arg(&self.db_context.host)
         .arg("-U")
         .arg(&self.db_context.username)
         .arg("-d")
@@ -78,14 +82,9 @@ impl ScriptBuilder<'_> {
         .spawn()
         .expect("SPAWN ERROR");
 
-    let mut s: String = String::new();
-    let mut stdo = pg_dump.stdout.unwrap(); 
-    // let thign =stdo.read_to_string(&mut s).expect("NO");
-    // println!("{:?}", s);
-    // println!("{}", fk.constraint_name);
-    // println!("{}", fk.dependent_column_name);
+    let stdo = pg_dump.stdout.unwrap(); 
+    
     let ptn = fk.get_parent_table_name();
-    // println!("{ptn}");
     let arg = format!(
             "/^ALTER TABLE.*{}.*/,/.*ADD CONSTRAINT.*{}.*FOREIGN KEY.*{}.*;$/p",
             ptn,
@@ -101,8 +100,14 @@ impl ScriptBuilder<'_> {
         .output()
         .expect("ERROR SPAWNING SED");
 
-    // Read the output of pg_dump
-    return Ok(String::from_utf8(sed_output.stdout).expect("Should be able to send bytes to string"));
+
+    let sed_stdout = String::from_utf8(sed_output.stdout).expect("Should be able to send bytes to string"); 
+    let lines: Vec<&str> = sed_stdout.lines().collect();
+    let out = match lines.len() {
+        n if n >= 2 => format!("{}\n{}", lines[n - 2], lines[n - 1]),
+        _ => lines.join("\n")
+    };
+    return Ok(out);
     // let status = pg_dump.wait().expect("CANTE");
     // if !status.success() {
     //     eprintln!("pg_dump failed with exit code: {}", status);
