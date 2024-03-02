@@ -1,10 +1,10 @@
-use std::{env, error::{self, Error}, fmt, fs::File, io::{self, BufRead, Read, Write}, process::{Command, Stdio}, str::FromStr};
+use std::{fs::File, io::Read};
 use serde_json::Value;
 use anyhow::{Result, anyhow};
 
 
-use colored::Colorize;
-use sqlx::{prelude::FromRow, ConnectOptions};
+// use colored::Colorize;
+use sqlx::ConnectOptions;
 use sqlx_postgres::{PgConnectOptions, PgPool};
 use sqlx_core::Url;
 
@@ -26,6 +26,7 @@ use script_builder::ScriptBuilder;
 // }
 
 
+#[derive(Clone)]
 pub struct DBContext {
     host: String,
     username: String,
@@ -72,7 +73,8 @@ fn get_db_url_from_config() -> Result<String> {
 async fn main() {
     let db_url  =  get_db_url_from_config().expect("Couldn't parse URL");
     let url: Url = db_url.parse().expect("Could not parse connection string into URL");
-    let options = PgConnectOptions::from_url(&url).expect("Error Parsing Connection Options");
+    let options = PgConnectOptions::from_url(&url).expect("Error Parsing Connection Options")
+        .ssl_mode(sqlx_postgres::PgSslMode::Prefer);
 
     let dbc = DBContext::from_url(&url).expect("Error building context from DB URL");
 
@@ -104,16 +106,17 @@ async fn main() {
     script_generator.add_buffer_line("-- DELETE DEPENDENTS\n\n");
 
     for dep_obj in dep_objs.iter() {
-        let obj_name = dep_obj.get_full_name();
-        let dep_obj_script_header = format!("-- VIEW {}\n", &obj_name); 
-        script_generator.add_buffer_line(dep_obj_script_header.as_str());
+            let obj_name = dep_obj.get_full_name();
+            let dep_obj_script_header = format!("-- VIEW {}\n", &obj_name); 
+            script_generator.add_buffer_line(dep_obj_script_header.as_str());
 
-        let script = script_generator.get_delete_script(
-            obj_name, 
-            "VIEW".to_string()
-        );
-        script_generator.add_buffer_line(format!("{}\n\n", script).as_str());
+            let script = script_generator.get_delete_script(
+                obj_name, 
+                "VIEW".to_string()
+            );
+            script_generator.add_buffer_line(format!("{}\n\n", script).as_str());
     }
+    
 
     for fk in fks.iter() {
         let fk_header = format!("-- FK {}\n", fk.constraint_name);
@@ -123,31 +126,10 @@ async fn main() {
         script_generator.add_buffer_line(&format!("{}\n\n", script));
     }
 
-    for dep_obj in dep_objs.iter() {
-        let create_header = format!("-- VIEW {}\n", dep_obj.dependent_view);
-        script_generator.add_buffer_line(&create_header);
-        match script_generator.get_create_script(
-            dep_obj.get_full_name(),
-            dep_obj.get_type_name().to_string()
-        ) {
-            Ok(script) => {
-                script_generator.add_buffer_line(&format!("{}\n\n", script));
-            },
-            Err(_) => println!("Failed to print script for dependent script")
-        }
-    };
-    script_generator.add_buffer_line("\n\n\n\n\n\n-- ADD BACK DEPENDENTS\n\n");
-    for fk in fks {
-        script_generator.add_buffer_line(&format!("-- FK {}\n", fk.constraint_name));
-        match script_generator.get_create_fk_script(fk) {
-            Ok(script) => script_generator.file_buffer.push_str(&format!("{}", script)),
-            Err(err)=>println!("Failed to print script for FK {}", err)
-        }
-    } 
+    script_generator.add_buffer_line("\n-- ADD BACK DEPENDENTS\n\n");
+    script_generator.get_dependent_object_create_scripts(dep_objs).expect("Errors in Dependent Object Thread Spawning");
+    script_generator.add_buffer_line("\n");
+    script_generator.get_fk_create_scripts(fks).expect("Errors in FK Thread Spawning");
 
-    // script_generator.display();
     script_generator.save_file("out.sql".to_string());
-    
-
-
 }

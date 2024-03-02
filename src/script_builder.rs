@@ -1,10 +1,12 @@
-use std::{fs, io::Read, process::{Command, Stdio}};
+use core::num;
+use std::{fs, io::Read, process::{Command, Stdio}, sync::{mpsc, Arc, Mutex}, thread};
 
 use anyhow::{Error, Result};
 use regex::Regex;
 
 use crate::{dependent_builder::{DependentObject, ForeignKey}, DBContext};
 
+#[derive(Clone)]
 pub struct ScriptBuilder<'a> {
     pub db_context: &'a DBContext,
     pub file_buffer: String
@@ -23,6 +25,22 @@ impl ScriptBuilder<'_> {
         }
         
         return result;
+    }
+    fn fmt_query(query: &str) -> Result<String> {
+        let replacements = [
+            (" ADD CONSTRAINT", "\nADD CONSTRAINT"),
+            (" FOREIGN KEY", "\nFOREIGN KEY"),
+            (" REFERENCES", "\nREFERENCES"),
+            (" CHECK", "\nCHECK"),
+        ];
+        let mut result = query.to_string();
+        for (pattern, value) in replacements {
+            let re = Regex::new(pattern)?;
+            result = re.replace_all(&result, value).to_string();
+        }
+        return Ok(result);
+
+
     }
     pub fn display(&self){ 
         println!("{}", self.file_buffer);
@@ -47,17 +65,17 @@ impl ScriptBuilder<'_> {
             fk.get_parent_table_name(), fk.constraint_name
         );
     }
-    pub fn get_create_script(&self, obj_name: String, obj_type: String) -> Result<String> {
-        let _ = std::env::set_var("PGPASSWORD", &self.db_context.password);
+    pub fn get_create_script(dep_obj: &DependentObject, db_context: &DBContext) -> Result<String> {
+        let _ = std::env::set_var("PGPASSWORD", &db_context.password);
         let pg_dump = Command::new("pg_dump")
             .arg("-h")
-            .arg(&self.db_context.host)
+            .arg(&db_context.host)
             .arg("-U")
-            .arg(&self.db_context.username)
+            .arg(&db_context.username)
             .arg("-d")
-            .arg(&self.db_context.db_name)
+            .arg(&db_context.db_name)
             .arg("-t")
-            .arg(obj_name)
+            .arg(&dep_obj.get_full_name())
             .stdout(Stdio::piped())
             .spawn()
             .expect("SPAWN ERROR");
@@ -65,30 +83,30 @@ impl ScriptBuilder<'_> {
     let sed_output = Command::new("sed")
         .arg("-n")
         .arg("-e")
-        .arg(format!("/^CREATE {}/,/;/p", obj_type))
+        .arg(format!("/^CREATE {}/,/;/p", &dep_obj.get_type_name()))
         .stdin(pg_dump.stdout.unwrap())
         .output()
         .expect("ERROR SPAWNING SED");
 
-    // Read the output of pg_dump
-    return Ok(String::from_utf8(sed_output.stdout).expect("Should be able to send bytes to string"));
-    // let status = pg_dump.wait().expect("CANTE");
-    // if !status.success() {
-    //     eprintln!("pg_dump failed with exit code: {}", status);
-    //     std::process::exit(1);
-    // }
+        // Read the output of pg_dump
+        let final_script = format!(
+            "-- VIEW {}\n\n{}",
+            &dep_obj.get_full_name(),
+            String::from_utf8(sed_output.stdout).expect("Should be able to send bytes to string")
+        );
+        return Ok(final_script);
     }
 
 
-    pub fn get_create_fk_script(&self, fk: ForeignKey) -> Result<String> {
-        let _ = std::env::set_var("PGPASSWORD", &self.db_context.password);
+    pub fn get_create_fk_script(fk: &ForeignKey, db_context: &DBContext) -> Result<String> {
+        let _ = std::env::set_var("PGPASSWORD", &db_context.password);
         let pg_dump = Command::new("pg_dump")
         .arg("-h")
-        .arg(&self.db_context.host)
+        .arg(&db_context.host)
         .arg("-U")
-        .arg(&self.db_context.username)
+        .arg(&db_context.username)
         .arg("-d")
-        .arg(&self.db_context.db_name)
+        .arg(&db_context.db_name)
         .arg("-t")
         .arg(fk.get_parent_table_name())
         .arg("--section=post-data")
@@ -97,25 +115,135 @@ impl ScriptBuilder<'_> {
         .expect("SPAWN ERROR");
 
         let mut stdo = pg_dump.stdout.unwrap(); 
-        
+
+        // Get a well formatted file
         let ptn = fk.get_parent_table_name();
         let mut buf = String::new();
         stdo.read_to_string(&mut buf)?;
         let text_stream: String = buf.chars().filter(|&c| {c != '\n' && c != '\t'}).collect();
         let collapsed_spaces = Self::collapse_spaces(&text_stream);
-        let result = format!(
+
+        // Regex
+        let pattern = format!(
             r"ALTER TABLE.*?{}.*?ADD CONSTRAINT {}.*?;", 
             &ptn, 
             &fk.constraint_name
-        ).to_string();
-        let re = Regex::new(&result).expect("PARSER ERROR");
+        );
+        let re = Regex::new(&pattern).expect("Parser Error");
         if let Some(captures) = re.captures(&collapsed_spaces) {
             if let Some(res) = captures.get(0) {
-                return Ok(res.as_str().to_string());
+                let formatted_query = Self::fmt_query(res.as_str())?;
+                return Ok(
+                    format!(
+                        "-- FK {}\n\n{}",
+                        fk.constraint_name,
+                        formatted_query
+                    )
+                );
             }
         }
-        return Err(Error::msg("No pattern matches found"));
+        return Err(Error::msg("No pattern matches found in FK create script"));
     }
 
 
+    pub fn get_fk_create_scripts(&mut self, fks: Vec<ForeignKey>) -> Result<()> {
+        self.add_buffer_line("\n/* --- FOREIGN KEYS --- */\n\n\n");
+        let (sender, receiver ) = mpsc::channel::<Result<(usize, String)>>();
+        
+        let num_items = fks.len();
+        let fks = Arc::new(Mutex::new(fks));
+        let mut handles = Vec::new();
+
+        for ix in 0..num_items {
+            let fks = Arc::clone(&fks);
+            let db_context = self.db_context.clone();
+            let sender = sender.clone();
+            let th = thread::spawn(move || {
+                let items = fks.lock().unwrap();
+                let item = items.get(ix).unwrap();
+                if let Ok(str) = Self::get_create_fk_script(item, &db_context) {
+                    let _ = sender.send(Ok((ix, str)));
+                } else {
+                    let _ = sender.send(Err(Error::msg("Error processing fk script")));
+                }
+            });
+            handles.push(th);
+        }
+
+        for th in handles {
+            th.join().unwrap();
+        }
+
+        let mut results = Vec::new();
+        for _ in 0..num_items {
+            match receiver.recv() {
+                Ok(res) => {
+                    match res {
+                        Ok(tuple) => results.push(tuple),
+                        Err(_) => println!("ERR")
+                    }
+                },
+                Err(_) => println!("ERR"),
+            }
+        }
+        results.sort();
+        for res in results {
+            self.add_buffer_line(format!("{}\n",&res.1).as_str());
+        }
+        
+
+        return Ok(());
+    }
+    pub fn get_dependent_object_create_scripts(
+        &mut self, dependent_objects: Vec<DependentObject>
+    ) -> Result<()> {
+        self.add_buffer_line("\n/* --- VIEWS --- */\n\n\n");
+        // Multithreaded calling of pg_dump to extract create scripts
+        let (sender, receiver) = mpsc::channel::<Result<(usize, String)>>();
+        let inputs_arc = Arc::new(Mutex::new(dependent_objects));
+        let dbc = Arc::new(Mutex::new(self.db_context.clone()));
+
+        let mut handles = Vec::new();
+
+        for (index, _) in inputs_arc.lock().unwrap().iter().enumerate() {
+            let sender = sender.clone();
+            let items_to_process = Arc::clone(&inputs_arc);
+            let builder_instance = Arc::clone(&dbc);
+
+
+            let th = thread::spawn(move || {
+                let items = items_to_process.lock().unwrap();
+                let item = items.get(index).unwrap();
+                if let Ok(str) = Self::get_create_script(item, &builder_instance.lock().unwrap()) {
+                    let _ = sender.send(Ok((index, str)));
+                } else {
+                    let _ = sender.send(Err(Error::msg("Error ")));
+                }
+            });
+            handles.push(th);
+        };
+        // Collect results
+        for th in handles {
+            th.join().expect("Thread error");
+        }
+
+        let mut results = Vec::new();
+        for _ in 0..inputs_arc.lock().unwrap().len() {
+            match receiver.recv() {
+                Ok(res) => {
+                    match res {
+                        Ok(tuple) => results.push(tuple),
+                        Err(_) => println!("ERR")
+                    }
+                },
+                Err(_) => println!("ERR"),
+            }
+        }
+        results.sort();
+        for res in results {
+            self.add_buffer_line(format!("{}\n",&res.1).as_str());
+        }
+        
+        return Ok(());
+    }
 }
