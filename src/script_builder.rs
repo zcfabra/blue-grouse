@@ -1,6 +1,7 @@
 use std::{fs, io::Read, process::{Command, Stdio}};
 
-use anyhow::Result;
+use anyhow::{Error, Result};
+use regex::Regex;
 
 use crate::{dependent_builder::{DependentObject, ForeignKey}, DBContext};
 
@@ -10,6 +11,19 @@ pub struct ScriptBuilder<'a> {
 }
 
 impl ScriptBuilder<'_> {
+    fn collapse_spaces(input: &str) -> String {
+        let mut result = String::new();
+        let mut prev_char: Option<char> = None;
+        
+        for current_char in input.chars() {
+            if current_char != ' ' || prev_char != Some(' ') {
+                result.push(current_char);
+            }
+            prev_char = Some(current_char);
+        }
+        
+        return result;
+    }
     pub fn display(&self){ 
         println!("{}", self.file_buffer);
     }
@@ -66,7 +80,7 @@ impl ScriptBuilder<'_> {
     }
 
 
-    pub fn get_create_fk_script(&self, fk: ForeignKey) -> Result<String, ()> {
+    pub fn get_create_fk_script(&self, fk: ForeignKey) -> Result<String> {
         let _ = std::env::set_var("PGPASSWORD", &self.db_context.password);
         let pg_dump = Command::new("pg_dump")
         .arg("-h")
@@ -82,37 +96,26 @@ impl ScriptBuilder<'_> {
         .spawn()
         .expect("SPAWN ERROR");
 
-    let stdo = pg_dump.stdout.unwrap(); 
-    
-    let ptn = fk.get_parent_table_name();
-    let arg = format!(
-            "/^ALTER TABLE.*{}.*/,/.*ADD CONSTRAINT.*{}.*FOREIGN KEY.*{}.*;$/p",
-            ptn,
-            fk.constraint_name,
-            fk.dependent_column_name
-        );
-    // println!("{arg}");
-    let sed_output = Command::new("sed")
-        .arg("-n")
-        .arg("-e")
-        .arg(arg)
-        .stdin(stdo)
-        .output()
-        .expect("ERROR SPAWNING SED");
-
-
-    let sed_stdout = String::from_utf8(sed_output.stdout).expect("Should be able to send bytes to string"); 
-    let lines: Vec<&str> = sed_stdout.lines().collect();
-    let out = match lines.len() {
-        n if n >= 2 => format!("{}\n{}", lines[n - 2], lines[n - 1]),
-        _ => lines.join("\n")
-    };
-    return Ok(out);
-    // let status = pg_dump.wait().expect("CANTE");
-    // if !status.success() {
-    //     eprintln!("pg_dump failed with exit code: {}", status);
-    //     std::process::exit(1);
-    // }
+        let mut stdo = pg_dump.stdout.unwrap(); 
+        
+        let ptn = fk.get_parent_table_name();
+        let mut buf = String::new();
+        stdo.read_to_string(&mut buf)?;
+        let text_stream: String = buf.chars().filter(|&c| {c != '\n' && c != '\t'}).collect();
+        let collapsed_spaces = Self::collapse_spaces(&text_stream);
+        let result = format!(
+            r"ALTER TABLE.*?{}.*?ADD CONSTRAINT {}.*?;", 
+            &ptn, 
+            &fk.constraint_name
+        ).to_string();
+        let re = Regex::new(&result).expect("PARSER ERROR");
+        if let Some(captures) = re.captures(&collapsed_spaces) {
+            if let Some(res) = captures.get(0) {
+                return Ok(res.as_str().to_string());
+            }
+        }
+        return Err(Error::msg("No pattern matches found"));
     }
+
 
 }

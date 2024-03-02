@@ -141,11 +141,11 @@ async fn main() {
         script_generator.add_buffer_line(&format!("-- FK {}\n", fk.constraint_name));
         match script_generator.get_create_fk_script(fk) {
             Ok(script) => script_generator.file_buffer.push_str(&format!("{}", script)),
-            Err(_)=>print!("Failed to print script for FK")
+            Err(err)=>println!("Failed to print script for FK {}", err)
         }
     } 
 
-    script_generator.display();
+    // script_generator.display();
     script_generator.save_file("out.sql".to_string());
     
 
