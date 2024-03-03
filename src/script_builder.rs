@@ -125,7 +125,7 @@ impl ScriptBuilder<'_> {
 
         // Regex
         let pattern = format!(
-            r"ALTER TABLE.*?{}.*?ADD CONSTRAINT {}.*?;", 
+            r"ALTER TABLE.*?{} ADD CONSTRAINT {}.*?;", 
             &ptn, 
             &fk.constraint_name
         );
